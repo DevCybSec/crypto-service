@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -52,6 +53,24 @@ type DecryptRequest struct {
 
 type DecryptResponse struct {
 	DecryptedContent string `json:"decryptedContent"`
+}
+
+type SignRequest struct {
+	PrivateKey string `json:"privateKey"`
+	Passphrase string `json:"passphrase"` // Contraseña de la clave privada
+	Content    string `json:"content"`    // Contenido a firmar
+}
+type SignResponse struct {
+	Signature string `json:"signature"` // Firma en Base64
+}
+
+type VerifyRequest struct {
+	PublicKey string `json:"publicKey"`
+	Content   string `json:"content"`   // Contenido original
+	Signature string `json:"signature"` // Firma en Base64
+}
+type VerifyResponse struct {
+	IsValid bool `json:"isValid"`
 }
 
 // --- Lógica de Criptografía Asimétrica (RSA) ---
@@ -258,6 +277,79 @@ func decryptWithPrivateKey(encryptedContent string, privateKeyPEM string, passph
 	return string(decryptedBytes), nil
 }
 
+func signContent(privateKeyPEM string, passphrase []byte, content string) (string, error) {
+	// 1. Decodificar y descifrar el bloque PEM (Reutilizamos tu lógica)
+	block, _ := pem.Decode([]byte(privateKeyPEM))
+	if block == nil {
+		return "", errors.New("failed to parse PEM block")
+	}
+
+	var decryptedKeyBytes []byte
+	var err error
+	if block.Type == "ENCRYPTED PRIVATE KEY" {
+		decryptedKeyBytes, err = decryptPrivateKeyPEM(block, passphrase)
+		if err != nil {
+			return "", fmt.Errorf("failed to decrypt PEM block: %w", err)
+		}
+	} else {
+		decryptedKeyBytes = block.Bytes
+	}
+
+	privateKey, err := x509.ParsePKCS1PrivateKey(decryptedKeyBytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse private key: %w", err)
+	}
+
+	// 2. Hashear el contenido (SHA-256)
+	hashed := sha256.Sum256([]byte(content))
+
+	// 3. Firmar el hash usando RSA-PSS
+	signature, err := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, hashed[:], nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign: %w", err)
+	}
+
+	// 4. Devolver la firma como Base64
+	return base64.StdEncoding.EncodeToString(signature), nil
+}
+
+// verifySignature (Verifica la firma usando la clave pública)
+func verifySignature(publicKeyPEM string, content string, signatureB64 string) (bool, error) {
+	// 1. Parsear la clave pública PEM
+	block, _ := pem.Decode([]byte(publicKeyPEM))
+	if block == nil {
+		return false, errors.New("failed to parse PEM block containing the public key")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse public key: %w", err)
+	}
+	rsaPub, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return false, errors.New("not an RSA public key")
+	}
+
+	// 2. Decodificar la firma (Base64)
+	signature, err := base64.StdEncoding.DecodeString(signatureB64)
+	if err != nil {
+		return false, fmt.Errorf("failed to decode base64 signature: %w", err)
+	}
+
+	// 3. Hashear el contenido original
+	hashed := sha256.Sum256([]byte(content))
+
+	// 4. Verificar la firma PSS
+	err = rsa.VerifyPSS(rsaPub, crypto.SHA256, hashed[:], signature, nil)
+	if err != nil {
+		// Si 'err' no es nulo, la firma es inválida
+		log.Printf("Verification failed: %v", err)
+		return false, nil
+	}
+
+	// La firma es válida
+	return true, nil
+}
+
 // --- Handlers HTTP ---
 
 func generateKeysHandler(w http.ResponseWriter, r *http.Request) {
@@ -339,6 +431,48 @@ func decryptHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// 4. Endpoint: /asymmetric/sign
+func signHandler(w http.ResponseWriter, r *http.Request) {
+	var req SignRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	signature, err := signContent(req.PrivateKey, []byte(req.Passphrase), req.Content)
+	if err != nil {
+		log.Printf("Error during signing: %v", err)
+		http.Error(w, "Signing failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(SignResponse{
+		Signature: signature,
+	})
+}
+
+// 5. Endpoint: /asymmetric/verify
+func verifyHandler(w http.ResponseWriter, r *http.Request) {
+	var req VerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	isValid, err := verifySignature(req.PublicKey, req.Content, req.Signature)
+	if err != nil {
+		log.Printf("Error during verification: %v", err)
+		http.Error(w, "Verification failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(VerifyResponse{
+		IsValid: isValid,
+	})
+}
+
 // --- Middleware CORS ---
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -409,7 +543,8 @@ func main() {
 	mux.Handle("/asymmetric/generate-keys", http.HandlerFunc(generateKeysHandler))
 	mux.Handle("/asymmetric/encrypt", http.HandlerFunc(encryptHandler))
 	mux.Handle("/asymmetric/decrypt", http.HandlerFunc(decryptHandler))
-	// (Futuro: mux.Handle("/symmetric/encrypt", ...))
+	mux.Handle("/asymmetric/sign", http.HandlerFunc(signHandler))
+	mux.Handle("/asymmetric/verify", http.HandlerFunc(verifyHandler))
 
 	handler := corsMiddleware(rateLimitMiddleware(mux))
 
